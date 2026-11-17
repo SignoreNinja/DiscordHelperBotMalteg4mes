@@ -1,168 +1,87 @@
+
 'use strict';
 
 require('dotenv').config();
 
-const {
-  Client,
-  Events,
-  GatewayIntentBits,
-  SlashCommandBuilder,
-  ChannelType,
-  MessageFlags,
-  ApplicationCommandType
-} = require('discord.js');
-
+const { Events, MessageFlags } = require('discord.js');
+const { client } = require('./client');
+const { config } = require('./config');
+const { registerCommands } = require('./command');
 const { handleTicketInteraction } = require('./features/tickets/handlers');
 const {
   handleStreamInteraction,
   startTwitchNotifications
 } = require('./features/twitch/handlers');
 
-// Zugangsdaten niemals direkt in den Quellcode schreiben.
-for (const key of ['DISCORD_TOKEN', 'GUILD_ID']) {
-  if (!process.env[key]) {
-    throw new Error(`Die Umgebungsvariable ${key} fehlt.`);
+let listenersRegistered = false;
+let startPromise = null;
+let twitchInterval = null;
+let stopping = false;
+
+function validateConfig() {
+  const missing = ['DISCORD_TOKEN', 'GUILD_ID'].filter(
+    key => !process.env[key]?.trim()
+  );
+
+  if (missing.length) {
+    throw new Error(`Fehlende Umgebungsvariablen: ${missing.join(', ')}`);
+  }
+
+  if (config.guildId !== process.env.GUILD_ID.trim()) {
+    throw new Error('GUILD_ID stimmt nicht mit config.js überein.');
   }
 }
 
-function pollMinutes(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 1
-    ? Math.min(60, Math.floor(number))
-    : 5;
-}
-
-const config = {
-  guildId: process.env.GUILD_ID,
-  teamRoleName: process.env.TEAM_ROLE_NAME || 'Team',
-  ticketNotificationChannelId: process.env.TICKET_NOTIFICATION_CHANNEL_ID || null,
-  streamAlertChannelId: process.env.STREAM_ALERT_CHANNEL_ID || null,
-  twitchClientId: process.env.TWITCH_CLIENT_ID || null,
-  twitchClientSecret: process.env.TWITCH_CLIENT_SECRET || null,
-  streamPollMinutes: pollMinutes(process.env.STREAM_POLL_MINUTES)
-};
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers
-  ]
-});
-
-// Die Befehlsoptionen entsprechen features/tickets/handlers.js.
-function buildCommands() {
-  const ticket = new SlashCommandBuilder()
-    .setName('ticket')
-    .setDescription('Verwaltet Support-Tickets als private Threads')
-    .addSubcommand(subcommand => subcommand
-      .setName('setup')
-      .setDescription('Erstellt das Ticket-Auswahlmenü im aktuellen Kanal')
-      .addChannelOption(option => option
-        .setName('benachrichtigungskanal')
-        .setDescription('Kanal für Ticket-Benachrichtigungen')
-        .addChannelTypes(ChannelType.GuildText)
-        .setRequired(true))
-      .addRoleOption(option => option
-        .setName('supportrolle')
-        .setDescription('Optionale Rolle für die Ticket-Bearbeitung')))
-    .addSubcommand(subcommand => subcommand
-      .setName('close')
-      .setDescription('Schließt das aktuelle Ticket sofort')
-      .addStringOption(option => option
-        .setName('grund')
-        .setDescription('Optionaler Schließungsgrund')
-        .setMaxLength(500)))
-    .addSubcommand(subcommand => subcommand
-      .setName('close-anfrage')
-      .setDescription('Schlägt eine zeitgesteuerte Ticket-Schließung vor')
-      .addIntegerOption(option => option
-        .setName('minuten')
-        .setDescription('Automatisch schließen nach dieser Anzahl Minuten')
-        .setMinValue(1)
-        .setMaxValue(10080)
-        .setRequired(true))
-      .addStringOption(option => option
-        .setName('grund')
-        .setDescription('Optionaler Grund')
-        .setMaxLength(500)))
-    .addSubcommand(subcommand => subcommand
-      .setName('add')
-      .setDescription('Fügt ein Mitglied zum Ticket hinzu')
-      .addUserOption(option => option
-        .setName('mitglied')
-        .setDescription('Mitglied, das Zugriff erhalten soll')
-        .setRequired(true)))
-    .addSubcommand(subcommand => subcommand
-      .setName('rename')
-      .setDescription('Benennt das Ticket um')
-      .addStringOption(option => option
-        .setName('name')
-        .setDescription('Neuer Ticket-Titel')
-        .setMaxLength(50)
-        .setRequired(true)));
-
-  const twitch = new SlashCommandBuilder()
-    .setName('stream-rollen')
-    .setDescription('Erstellt die Twitch-Benachrichtigungsrollen und Buttons');
-
-  return [ticket, twitch];
-}
-
-async function registerCommands() {
-  const guild = await client.guilds.fetch(config.guildId);
-  const existing = await guild.commands.fetch();
-
-  // Andere Slash-Commands (z. B. Moderation) bleiben bestehen.
-  for (const command of buildCommands()) {
-    const definition = command.toJSON();
-    const previous = existing.find(item =>
-      item.name === definition.name &&
-      item.type === ApplicationCommandType.ChatInput
-    );
-
-    if (previous) {
-      await guild.commands.edit(previous.id, definition);
-    } else {
-      await guild.commands.create(definition);
-    }
-  }
-  console.log('[Discord] Ticket- und Twitch-Commands registriert.');
-}
-
-let twitchTimer = null;
-
-client.once(Events.ClientReady, async readyClient => {
-  console.log(`[Discord] Angemeldet als ${readyClient.user.tag}.`);
+async function initializeModules(readyClient) {
+  console.log(`[Bot] Online als ${readyClient.user.tag}`);
+  console.log(`[Bot] Server-ID: ${config.guildId}`);
 
   try {
-    await registerCommands();
+    await registerCommands(readyClient, config.guildId);
   } catch (error) {
-    console.error('[Discord] Slash-Command-Registrierung fehlgeschlagen:', error);
+    console.error('[Commands] Registrierung fehlgeschlagen:', error);
   }
 
-  if (config.streamAlertChannelId && config.twitchClientId && config.twitchClientSecret) {
-    twitchTimer = startTwitchNotifications(client, config);
-    console.log(`[Twitch] Live-Überwachung alle ${config.streamPollMinutes} Minuten gestartet.`);
-  } else {
-    console.warn('[Twitch] Nicht gestartet: Twitch-Zugangsdaten oder Stream-Kanal fehlen.');
-  }
-});
+  const twitchConfigured = Boolean(
+    config.streamAlertChannelId &&
+    config.twitchClientId &&
+    config.twitchClientSecret
+  );
 
-client.on(Events.InteractionCreate, async interaction => {
-  if (!interaction.inGuild() || interaction.guildId !== config.guildId) return;
+  if (twitchConfigured && !twitchInterval && !stopping) {
+    try {
+      twitchInterval = startTwitchNotifications(readyClient, config);
+      console.log(
+        `[Twitch] Überwachung aktiv (alle ${config.streamPollMinutes} Minuten).`
+      );
+    } catch (error) {
+      console.error('[Twitch] Start fehlgeschlagen:', error);
+    }
+  } else if (!twitchConfigured) {
+    console.warn('[Twitch] Nicht konfiguriert – Überwachung deaktiviert.');
+  }
+}
+
+async function handleInteraction(interaction) {
+  if (!interaction.inGuild() || interaction.guildId !== config.guildId) {
+    return;
+  }
 
   try {
     if (await handleTicketInteraction(interaction, config)) return;
     if (await handleStreamInteraction(interaction)) return;
-    // Weitere Feature-Handler bei Bedarf hier ergänzen.
+
+    // Weitere Feature-Handler hier hinzufügen.
   } catch (error) {
-    console.error('[Discord] Interaktion fehlgeschlagen:', error);
+    console.error('[Bot] Interaktionsfehler:', error);
+
     if (!interaction.isRepliable()) return;
 
     const response = {
-      content: 'Beim Ausführen dieser Aktion ist ein Fehler aufgetreten.',
+      content: 'Bei der Verarbeitung ist ein Fehler aufgetreten.',
       flags: MessageFlags.Ephemeral
     };
+
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.followUp(response);
@@ -170,33 +89,68 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.reply(response);
       }
     } catch (replyError) {
-      console.error('[Discord] Fehlerantwort fehlgeschlagen:', replyError);
+      console.error('[Bot] Konnte Fehlerantwort nicht senden:', replyError);
     }
   }
-});
-
-client.on(Events.Error, error => {
-  console.error('[Discord] Client-Fehler:', error);
-});
-
-process.on('unhandledRejection', error => {
-  console.error('[Node] Unbehandelte Promise-Rejection:', error);
-});
-
-let stopping = false;
-async function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
-  console.log(`[Bot] Beende nach ${signal} ...`);
-  if (twitchTimer) clearInterval(twitchTimer);
-  await client.destroy();
-  process.exit(0);
 }
 
-process.once('SIGINT', () => void shutdown('SIGINT'));
-process.once('SIGTERM', () => void shutdown('SIGTERM'));
+function registerListeners() {
+  if (listenersRegistered) return;
+  listenersRegistered = true;
 
-client.login(process.env.DISCORD_TOKEN).catch(error => {
-  console.error('[Discord] Anmeldung fehlgeschlagen:', error);
-  process.exitCode = 1;
-});
+  client.once(Events.ClientReady, readyClient => {
+    void initializeModules(readyClient).catch(error => {
+      console.error('[Bot] Modul-Initialisierung fehlgeschlagen:', error);
+    });
+  });
+
+  client.on(Events.InteractionCreate, interaction => {
+    void handleInteraction(interaction).catch(error => {
+      console.error('[Bot] Unerwarteter Interaktionsfehler:', error);
+    });
+  });
+
+  client.on(Events.Error, error => {
+    console.error('[Discord] Client-Fehler:', error);
+  });
+}
+
+function startBot() {
+  if (stopping) {
+    throw new Error('Der Bot wird gerade beendet.');
+  }
+  if (startPromise) return startPromise;
+
+  validateConfig();
+  registerListeners();
+
+  startPromise = client.login(process.env.DISCORD_TOKEN).then(
+    () => client,
+    error => {
+      startPromise = null;
+      throw error;
+    }
+  );
+
+  return startPromise;
+}
+
+async function stopBot() {
+  if (stopping) return;
+  stopping = true;
+
+  if (twitchInterval) {
+    clearInterval(twitchInterval);
+    twitchInterval = null;
+  }
+
+  await client.destroy();
+  console.log('[Bot] Discord-Verbindung geschlossen.');
+}
+
+module.exports = { client, startBot, stopBot };
+
+// Unterstützt auch "node bot.js", ohne einen zweiten Einstiegspunkt zu erstellen.
+if (require.main === module) {
+  require('./index');
+}
